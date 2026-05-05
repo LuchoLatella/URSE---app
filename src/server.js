@@ -1,11 +1,10 @@
 const express  = require('express');
 const session  = require('express-session');
-const SQLiteStore = require('connect-sqlite3')(session);
 const multer   = require('multer');
 const path     = require('path');
 const fs       = require('fs');
 
-const { usuarios, resoluciones, dotacion, liquidaciones } = require('./db');
+const { initDb, usuarios, resoluciones, dotacion, liquidaciones } = require('./db');
 const { parseLiquidaciones, parseDotacion } = require('./parser');
 const { requireAuth, requireAdmin, apiError, apiOk } = require('./middleware');
 
@@ -13,7 +12,6 @@ const app  = express();
 const PORT = process.env.PORT || 3000;
 const DATA_DIR = path.join(__dirname, '..', 'data');
 
-// Asegurar directorio de datos
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 // -------- MIDDLEWARES --------
@@ -21,21 +19,19 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
+// Sesiones en memoria (simples, se pierden al reiniciar — OK para uso local)
 app.use(session({
-  store: new SQLiteStore({ db: 'sessions.db', dir: DATA_DIR }),
   secret: 'urse-secret-key-2026-gcaba',
   resave: false,
   saveUninitialized: false,
-  cookie: { maxAge: 8 * 60 * 60 * 1000 } // 8 horas
+  cookie: { maxAge: 8 * 60 * 60 * 1000 }
 }));
 
-// Multer: archivos en memoria (máx 50MB)
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 50 * 1024 * 1024 }
+  limits: { fileSize: 100 * 1024 * 1024 }
 });
 
-// Inyectar usuario en res.locals para vistas HTML (si las hubiera)
 app.use((req, res, next) => {
   res.locals.user = req.session.user || null;
   next();
@@ -64,12 +60,12 @@ app.get('/api/me', requireAuth, (req, res) => {
   res.json({ ok: true, user: req.session.user });
 });
 
-// -------- MAIN APP (SPA) --------
+// -------- MAIN APP --------
 app.get('/', requireAuth, (req, res) => {
   res.sendFile(path.join(__dirname, '..', 'public', 'app.html'));
 });
 
-// -------- API: USUARIOS (solo admin) --------
+// -------- API: USUARIOS --------
 app.get('/api/usuarios', requireAuth, requireAdmin, (req, res) => {
   res.json({ ok: true, data: usuarios.findAll() });
 });
@@ -82,7 +78,7 @@ app.post('/api/usuarios', requireAuth, requireAdmin, (req, res) => {
     usuarios.create({ username, password, nombre, rol });
     apiOk(res, { mensaje: 'Usuario creado' });
   } catch (e) {
-    if (e.message.includes('UNIQUE')) return apiError(res, 'El nombre de usuario ya existe');
+    if (e.message && e.message.includes('UNIQUE')) return apiError(res, 'El nombre de usuario ya existe');
     apiError(res, e.message);
   }
 });
@@ -114,10 +110,14 @@ app.post('/api/resoluciones', requireAuth, requireAdmin, (req, res) => {
   if (!['6183004','6183003'].includes(concepto))
     return apiError(res, 'Concepto inválido');
   try {
-    resoluciones.create({ nro, anio: parseInt(anio), cod_rep, desc_rep, concepto, autorizadas: parseFloat(autorizadas), creado_por: req.session.user.id });
+    resoluciones.create({
+      nro, anio: parseInt(anio), cod_rep, desc_rep, concepto,
+      autorizadas: parseFloat(autorizadas), creado_por: req.session.user.id
+    });
     apiOk(res, { mensaje: 'Resolución cargada' });
   } catch (e) {
-    if (e.message.includes('UNIQUE')) return apiError(res, 'Ya existe una resolución para ese año, repartición y concepto');
+    if (e.message && e.message.includes('UNIQUE'))
+      return apiError(res, 'Ya existe una resolución para ese año, repartición y concepto');
     apiError(res, e.message);
   }
 });
@@ -143,13 +143,15 @@ app.post('/api/dotacion/importar', requireAuth, requireAdmin, upload.single('arc
     const agentes = parseDotacion(req.file.buffer);
     if (!agentes.length) return apiError(res, 'No se encontraron agentes válidos en el archivo');
     dotacion.upsertBatch(agentes);
-    // Re-emparejar liquidaciones existentes con la nueva dotación
+    // Re-emparejar liquidaciones existentes
     const liqs = liquidaciones.findAll({});
-    const actualizadas = liqs.map(l => {
-      const d = dotacion.findByCuil(l.cuil);
-      return { ...l, cod_rep: d ? d.cod_rep : '', desc_rep: d ? d.desc_rep : '', matched: d ? 1 : 0 };
-    });
-    if (actualizadas.length) liquidaciones.upsertBatch(actualizadas.map(l => ({ ...l, matched: l.matched === 1 })));
+    if (liqs.length) {
+      const actualizadas = liqs.map(l => {
+        const d = dotacion.findByCuil(l.cuil);
+        return { ...l, cod_rep: d ? d.cod_rep : '', desc_rep: d ? d.desc_rep : '', matched: !!d };
+      });
+      liquidaciones.upsertBatch(actualizadas);
+    }
     apiOk(res, { total: agentes.length, mensaje: `${agentes.length.toLocaleString('es-AR')} agentes únicos importados` });
   } catch (e) {
     apiError(res, e.message);
@@ -171,25 +173,14 @@ app.post('/api/liquidaciones/importar', requireAuth, requireAdmin, upload.single
   try {
     const { registros, anio, skipped } = parseLiquidaciones(req.file.buffer);
     if (!registros.length) return apiError(res, 'No se encontraron registros URSE en el archivo');
-
-    // Emparejar con dotación
     registros.forEach(r => {
       const d = dotacion.findByCuil(r.cuil);
-      if (d) {
-        r.cod_rep  = d.cod_rep;
-        r.desc_rep = d.desc_rep;
-        r.matched  = true;
-      }
+      if (d) { r.cod_rep = d.cod_rep; r.desc_rep = d.desc_rep; r.matched = true; }
     });
-
     liquidaciones.upsertBatch(registros);
     const matched = registros.filter(r => r.matched).length;
     apiOk(res, {
-      total: registros.length,
-      matched,
-      sinMatch: registros.length - matched,
-      anio,
-      skipped,
+      total: registros.length, matched, sinMatch: registros.length - matched, anio, skipped,
       mensaje: `${registros.length} registros importados (año ${anio}). ${matched} emparejados con dotación.`
     });
   } catch (e) {
@@ -200,69 +191,46 @@ app.post('/api/liquidaciones/importar', requireAuth, requireAdmin, upload.single
 // -------- API: CONTROL --------
 app.get('/api/control', requireAuth, (req, res) => {
   const { anio, concepto, estado } = req.query;
+  const ress = resoluciones.findAll({ anio, concepto });
+  const liqs = liquidaciones.getAgrupado(anio);
 
-  const ress  = resoluciones.findAll({ anio, concepto });
-  const liqs  = liquidaciones.getAgrupado(anio);
-
-  // Mapa de liquidaciones: cod_rep+concepto+anio -> datos
   const liqMap = {};
-  liqs.forEach(l => {
-    const key = `${l.cod_rep}||${l.concepto}||${l.anio}`;
-    liqMap[key] = l;
-  });
+  liqs.forEach(l => { liqMap[`${l.cod_rep}||${l.concepto}||${l.anio}`] = l; });
 
-  // Reparticiones con liquidación pero sin resolución (error de datos)
   const resCubiertas = new Set(ress.map(r => `${r.cod_rep}||${r.concepto}||${r.anio}`));
   const sinResolucion = liqs.filter(l => !resCubiertas.has(`${l.cod_rep}||${l.concepto}||${l.anio}`));
 
-  // Cruzar
   let filas = ress.map(r => {
-    const key  = `${r.cod_rep}||${r.concepto}||${r.anio}`;
-    const liq  = liqMap[key] || { inc_total: 0, rol_total: 0, total: 0, agentes: 0 };
-    const total_liq = liq.total;
+    const key = `${r.cod_rep}||${r.concepto}||${r.anio}`;
+    const liq = liqMap[key] || { inc_total: 0, rol_total: 0, total: 0, agentes: 0 };
+    const total_liq = liq.total || 0;
     const saldo = r.autorizadas - total_liq;
-    const pct   = r.autorizadas > 0 ? (total_liq / r.autorizadas) * 100 : 0;
-    const estadoFila = saldo < 0 ? 'danger' : pct >= 80 ? 'warn' : 'ok';
+    const pct = r.autorizadas > 0 ? (total_liq / r.autorizadas) * 100 : 0;
     return {
-      id:         r.id,
-      nro:        r.nro,
-      anio:       r.anio,
-      cod_rep:    r.cod_rep,
-      desc_rep:   r.desc_rep,
-      concepto:   r.concepto,
-      autorizadas: r.autorizadas,
-      inc_total:  liq.inc_total || 0,
-      rol_total:  liq.rol_total || 0,
-      total_liq,
-      saldo,
-      pct: Math.round(pct * 10) / 10,
-      agentes:    liq.agentes || 0,
-      estado:     estadoFila,
+      id: r.id, nro: r.nro, anio: r.anio, cod_rep: r.cod_rep, desc_rep: r.desc_rep,
+      concepto: r.concepto, autorizadas: r.autorizadas,
+      inc_total: liq.inc_total || 0, rol_total: liq.rol_total || 0, total_liq,
+      saldo, pct: Math.round(pct * 10) / 10, agentes: liq.agentes || 0,
+      estado: saldo < 0 ? 'danger' : pct >= 80 ? 'warn' : 'ok',
     };
   });
 
-  // Filtro por estado
   if (estado && ['ok','warn','danger'].includes(estado)) {
     filas = filas.filter(f => f.estado === estado);
   }
 
-  // Métricas globales (sin filtro de estado para que sean correctas)
   const todasFilas = ress.map(r => {
-    const key = `${r.cod_rep}||${r.concepto}||${r.anio}`;
-    const liq = liqMap[key] || { total: 0 };
+    const liq = liqMap[`${r.cod_rep}||${r.concepto}||${r.anio}`] || { total: 0 };
     return { autorizadas: r.autorizadas, total_liq: liq.total || 0 };
   });
-  const totAut  = todasFilas.reduce((s, f) => s + f.autorizadas, 0);
-  const totLiq  = todasFilas.reduce((s, f) => s + f.total_liq, 0);
-  const totSaldo = totAut - totLiq;
-  const pctGlobal = totAut > 0 ? Math.round((totLiq / totAut) * 100) : 0;
+  const totAut = todasFilas.reduce((s, f) => s + f.autorizadas, 0);
+  const totLiq = todasFilas.reduce((s, f) => s + f.total_liq, 0);
 
   res.json({
-    ok: true,
-    filas,
-    sinResolucion,
+    ok: true, filas, sinResolucion,
     metricas: {
-      totAut, totLiq, totSaldo, pctGlobal,
+      totAut, totLiq, totSaldo: totAut - totLiq,
+      pctGlobal: totAut > 0 ? Math.round((totLiq / totAut) * 100) : 0,
       excedidos: todasFilas.filter(f => (f.autorizadas - f.total_liq) < 0).length,
       sinResolucion: sinResolucion.length,
     }
@@ -270,7 +238,12 @@ app.get('/api/control', requireAuth, (req, res) => {
 });
 
 // -------- START --------
-app.listen(PORT, () => {
-  console.log(`\n✓ Sistema Control URSE corriendo en http://localhost:${PORT}`);
-  console.log(`  Usuario por defecto: admin / admin1234\n`);
+initDb().then(() => {
+  app.listen(PORT, () => {
+    console.log(`\n✓ Sistema Control URSE corriendo en http://localhost:${PORT}`);
+    console.log(`  Usuario por defecto: admin / admin1234\n`);
+  });
+}).catch(err => {
+  console.error('Error iniciando la base de datos:', err);
+  process.exit(1);
 });
